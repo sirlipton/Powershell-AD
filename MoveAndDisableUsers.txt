@@ -1,0 +1,69 @@
+
+Import-Module ActiveDirectory
+
+# CSV input - add filepath
+$CsvPath = "C:\Users\Administrator\Documents\UsersToMove.txt"
+
+# Destination OU
+$TargetOU = "OU=Users,OU=Disabled Objects,DC=local,DC=int"
+
+# SAFETY: $true previews changes; $false performs them
+$WhatIfMode = $false
+
+# Confirm destination OU exists
+Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop |
+    Out-Null
+
+# Import CSV
+$Users = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+foreach ($User in $Users) {
+    $Sam = $User.sAMAccountName.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Sam)) {
+        Write-Warning "Skipping row with empty sAMAccountName."
+        continue
+    }
+
+    try {
+        # Find the account
+        $ADUser = Get-ADUser -Identity $Sam -ErrorAction Stop
+
+        if ($WhatIfMode) {
+            # Preview disabling the account
+            Disable-ADAccount `
+                -Identity $ADUser.DistinguishedName `
+                -WhatIf `
+                -ErrorAction Stop
+
+            # Preview moving the account
+            Move-ADObject `
+                -Identity $ADUser.DistinguishedName `
+                -TargetPath $TargetOU `
+                -WhatIf `
+                -ErrorAction Stop
+
+            Write-Host "PREVIEW: $Sam would be disabled and moved." `
+                -ForegroundColor Yellow
+        }
+        else {
+            # Disable the account first
+            Disable-ADAccount `
+                -Identity $ADUser.DistinguishedName `
+                -ErrorAction Stop
+
+            # Move the account to the destination OU
+            Move-ADObject `
+                -Identity $ADUser.DistinguishedName `
+                -TargetPath $TargetOU `
+                -ErrorAction Stop
+
+            Write-Host "SUCCESS: $Sam disabled and moved." `
+                -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "FAILED: $Sam - $($_.Exception.Message)" `
+            -ForegroundColor Red
+    }
+}
