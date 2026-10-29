@@ -1,0 +1,133 @@
+Import-Module ActiveDirectory
+
+# CSV input
+$CsvPath = "C:\Users\Administrator\Documents\UsersToMove.txt"
+
+# Destination OU
+$TargetOU = "OU=Users,OU=Disabled Objects,DC=local,DC=int"
+
+# SAFETY: $true previews changes; $false performs them
+$WhatIfMode = $false
+
+# Confirm destination OU exists
+Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop |
+    Out-Null
+
+# Import CSV
+$Users = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+foreach ($User in $Users) {
+    $Sam = $User.sAMAccountName.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Sam)) {
+        Write-Warning "Skipping row with empty sAMAccountName."
+        continue
+    }
+
+    try {
+        # Find the account
+        $ADUser = Get-ADUser -Identity $Sam `
+            -Properties Enabled, DistinguishedName `
+            -ErrorAction Stop
+
+        # Check whether the account is already in the target OU
+        $AlreadyInTargetOU = $ADUser.DistinguishedName.EndsWith(
+            ",$TargetOU",
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+
+        # Check account status
+        $AlreadyDisabled = -not $ADUser.Enabled
+
+        # Both conditions are already satisfied
+        if ($AlreadyDisabled -and $AlreadyInTargetOU) {
+            Write-Host "ALREADY DONE: $Sam is disabled and already in the Disabled OU." `
+                -ForegroundColor Cyan
+            continue
+        }
+
+        # Account is disabled but still needs moving
+        if ($AlreadyDisabled -and -not $AlreadyInTargetOU) {
+            if ($WhatIfMode) {
+                Move-ADObject `
+                    -Identity $ADUser.DistinguishedName `
+                    -TargetPath $TargetOU `
+                    -WhatIf `
+                    -ErrorAction Stop
+
+                Write-Host "PREVIEW: $Sam is already disabled and would be moved." `
+                    -ForegroundColor Yellow
+            }
+            else {
+                Move-ADObject `
+                    -Identity $ADUser.DistinguishedName `
+                    -TargetPath $TargetOU `
+                    -ErrorAction Stop
+
+                Write-Host "MOVED ONLY: $Sam was already disabled and has now been moved." `
+                    -ForegroundColor Green
+            }
+
+            continue
+        }
+
+        # Account is enabled but already in the target OU
+        if (-not $AlreadyDisabled -and $AlreadyInTargetOU) {
+            if ($WhatIfMode) {
+                Disable-ADAccount `
+                    -Identity $ADUser.DistinguishedName `
+                    -WhatIf `
+                    -ErrorAction Stop
+
+                Write-Host "PREVIEW: $Sam is already in the Disabled OU and would be disabled." `
+                    -ForegroundColor Yellow
+            }
+            else {
+                Disable-ADAccount `
+                    -Identity $ADUser.DistinguishedName `
+                    -ErrorAction Stop
+
+                Write-Host "DISABLED ONLY: $Sam was already in the Disabled OU and has now been disabled." `
+                    -ForegroundColor Green
+            }
+
+            continue
+        }
+
+        # Account is enabled and is not in the target OU
+        if ($WhatIfMode) {
+            Disable-ADAccount `
+                -Identity $ADUser.DistinguishedName `
+                -WhatIf `
+                -ErrorAction Stop
+
+            Move-ADObject `
+                -Identity $ADUser.DistinguishedName `
+                -TargetPath $TargetOU `
+                -WhatIf `
+                -ErrorAction Stop
+
+            Write-Host "PREVIEW: $Sam would be disabled and moved." `
+                -ForegroundColor Yellow
+        }
+        else {
+            # Disable first
+            Disable-ADAccount `
+                -Identity $ADUser.DistinguishedName `
+                -ErrorAction Stop
+
+            # Move to target OU
+            Move-ADObject `
+                -Identity $ADUser.DistinguishedName `
+                -TargetPath $TargetOU `
+                -ErrorAction Stop
+
+            Write-Host "SUCCESS: $Sam disabled and moved." `
+                -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "FAILED: $Sam - $($_.Exception.Message)" `
+            -ForegroundColor Red
+    }
+}
