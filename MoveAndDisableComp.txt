@@ -1,187 +1,82 @@
+
 Import-Module ActiveDirectory
 
-# CSV input
+# Configuration
 $CsvPath = "C:\Users\Administrator\Documents\ComputersList.txt"
-
-# Destination OU
 $TargetOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
+$WhatIfMode = $true  # $true = preview, $false = execute
 
-# SAFETY: $true previews changes; $false performs them
-$WhatIfMode = $false
-
-# Counters / results
-$Results = [System.Collections.Generic.List[object]]::new()
-
-# Confirm destination OU exists
-Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop |
-    Out-Null
-
-# Import CSV
+# Validate OU and import CSV
+Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop | Out-Null
 $Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
 
-Write-Host ""
-Write-Host ("=" * 100) -ForegroundColor DarkGray
-Write-Host " ACTIVE DIRECTORY COMPUTER DISABLE / MOVE REPORT" -ForegroundColor Cyan
-Write-Host ("=" * 100) -ForegroundColor DarkGray
-Write-Host ("Mode:        {0}" -f $(if ($WhatIfMode) { "PREVIEW ONLY" } else { "LIVE EXECUTION" }))
-Write-Host "Destination: $TargetOU"
-Write-Host ("-" * 100) -ForegroundColor DarkGray
-
-foreach ($Computer in $Computers) {
-    $Name = if ($null -ne $Computer.ComputerName) {
-        $Computer.ComputerName.Trim()
-    } else {
-        ""
-    }
+# Process computers
+$Results = foreach ($Computer in $Computers) {
+    $Name = $Computer.ComputerName.Trim()
 
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        $Results.Add([PSCustomObject]@{
+        [PSCustomObject]@{
             ComputerName = "(blank)"
             Status       = "SKIPPED"
-            Details      = "Empty ComputerName"
-        })
+            Details      = "Empty computer name"
+        }
         continue
     }
 
     try {
-        # Find the computer account
         $ADComputer = Get-ADComputer -Identity $Name `
-            -Properties Enabled, DistinguishedName `
-            -ErrorAction Stop
+            -Properties Enabled, DistinguishedName -ErrorAction Stop
 
-        # Check whether the computer is already in the target OU
-        $AlreadyInTargetOU = $ADComputer.DistinguishedName.EndsWith(
+        $Disabled = -not $ADComputer.Enabled
+        $InTargetOU = $ADComputer.DistinguishedName.EndsWith(
             ",$TargetOU",
-            [System.StringComparison]::OrdinalIgnoreCase
+            [StringComparison]::OrdinalIgnoreCase
         )
 
-        # Check account status
-        $AlreadyDisabled = -not $ADComputer.Enabled
-
-        if ($AlreadyDisabled -and $AlreadyInTargetOU) {
+        if ($Disabled -and $InTargetOU) {
             $Status = "ALREADY DONE"
-            $Details = "Disabled and already in destination OU"
-        }
-        elseif ($AlreadyDisabled -and -not $AlreadyInTargetOU) {
-            if ($WhatIfMode) {
-                Move-ADObject `
-                    -Identity $ADComputer.DistinguishedName `
-                    -TargetPath $TargetOU `
-                    -WhatIf `
-                    -ErrorAction Stop
-
-                $Status = "PREVIEW"
-                $Details = "Already disabled; would move to destination OU"
-            }
-            else {
-                Move-ADObject `
-                    -Identity $ADComputer.DistinguishedName `
-                    -TargetPath $TargetOU `
-                    -ErrorAction Stop
-
-                $Status = "MOVED ONLY"
-                $Details = "Was disabled; moved to destination OU"
-            }
-        }
-        elseif (-not $AlreadyDisabled -and $AlreadyInTargetOU) {
-            if ($WhatIfMode) {
-                Disable-ADAccount `
-                    -Identity $ADComputer.DistinguishedName `
-                    -WhatIf `
-                    -ErrorAction Stop
-
-                $Status = "PREVIEW"
-                $Details = "Already in destination OU; would disable"
-            }
-            else {
-                Disable-ADAccount `
-                    -Identity $ADComputer.DistinguishedName `
-                    -ErrorAction Stop
-
-                $Status = "DISABLED ONLY"
-                $Details = "Was in destination OU; computer account disabled"
-            }
+            $Details = "Disabled and already in target OU"
         }
         else {
-            if ($WhatIfMode) {
-                Disable-ADAccount `
-                    -Identity $ADComputer.DistinguishedName `
-                    -WhatIf `
-                    -ErrorAction Stop
-
-                Move-ADObject `
-                    -Identity $ADComputer.DistinguishedName `
-                    -TargetPath $TargetOU `
-                    -WhatIf `
-                    -ErrorAction Stop
-
-                $Status = "PREVIEW"
-                $Details = "Would disable and move to destination OU"
+            if (-not $Disabled) {
+                Disable-ADAccount -Identity $ADComputer `
+                    -WhatIf:$WhatIfMode -ErrorAction Stop
             }
-            else {
-                # Disable the computer account first
-                Disable-ADAccount `
-                    -Identity $ADComputer.DistinguishedName `
-                    -ErrorAction Stop
 
-                # Move the computer object
-                Move-ADObject `
-                    -Identity $ADComputer.DistinguishedName `
+            if (-not $InTargetOU) {
+                Move-ADObject -Identity $ADComputer `
                     -TargetPath $TargetOU `
-                    -ErrorAction Stop
+                    -WhatIf:$WhatIfMode -ErrorAction Stop
+            }
 
-                $Status = "SUCCESS"
-                $Details = "Disabled and moved to destination OU"
+            $Status = if ($WhatIfMode) { "PREVIEW" } else { "SUCCESS" }
+            $Details = if ($WhatIfMode) {
+                "Would disable and/or move as needed"
+            } else {
+                "Disabled and/or moved as needed"
             }
         }
 
-        $Results.Add([PSCustomObject]@{
+        [PSCustomObject]@{
             ComputerName = $Name
             Status       = $Status
             Details      = $Details
-        })
+        }
     }
     catch {
-        $Results.Add([PSCustomObject]@{
+        [PSCustomObject]@{
             ComputerName = $Name
             Status       = "FAILED"
             Details      = $_.Exception.Message
-        })
+        }
     }
 }
 
-# Display formatted results
-Write-Host ""
-Write-Host ("=" * 100) -ForegroundColor DarkGray
-Write-Host " RESULTS" -ForegroundColor Cyan
-Write-Host ("=" * 100) -ForegroundColor DarkGray
+# Display results and summary
+$Results | Format-Table ComputerName, Status, Details -AutoSize -Wrap
 
-$Results |
-    Format-Table -Property ComputerName, Status, Details -AutoSize -Wrap |
-    Out-Host
-
-# Summary
-$Total        = $Results.Count
-$AlreadyDone  = @($Results | Where-Object Status -eq "ALREADY DONE").Count
-$Success      = @($Results | Where-Object Status -eq "SUCCESS").Count
-$MovedOnly    = @($Results | Where-Object Status -eq "MOVED ONLY").Count
-$DisabledOnly = @($Results | Where-Object Status -eq "DISABLED ONLY").Count
-$Preview      = @($Results | Where-Object Status -eq "PREVIEW").Count
-$Failed       = @($Results | Where-Object Status -eq "FAILED").Count
-$Skipped      = @($Results | Where-Object Status -eq "SKIPPED").Count
-
-Write-Host ""
-Write-Host ("=" * 100) -ForegroundColor DarkGray
-Write-Host " SUMMARY" -ForegroundColor Cyan
-Write-Host ("=" * 100) -ForegroundColor DarkGray
-
-Write-Host ("Total processed : {0}" -f $Total)
-Write-Host ("Already complete: {0}" -f $AlreadyDone) -ForegroundColor Cyan
-Write-Host ("Disabled + moved: {0}" -f $Success) -ForegroundColor Green
-Write-Host ("Moved only      : {0}" -f $MovedOnly) -ForegroundColor Green
-Write-Host ("Disabled only   : {0}" -f $DisabledOnly) -ForegroundColor Green
-Write-Host ("Preview actions : {0}" -f $Preview) -ForegroundColor Yellow
-Write-Host ("Failed          : {0}" -f $Failed) -ForegroundColor Red
-Write-Host ("Skipped         : {0}" -f $Skipped) -ForegroundColor DarkYellow
-
-Write-Host ("=" * 100) -ForegroundColor DarkGray
+Write-Host "`nSUMMARY" -ForegroundColor Cyan
+$Results | Group-Object Status | Sort-Object Name |
+    ForEach-Object {
+        Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
+    }
