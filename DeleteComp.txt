@@ -1,0 +1,116 @@
+Import-Module ActiveDirectory
+
+# Configuration
+$CsvPath = "C:\Users\Administrator\Documents\ComputersList.txt"
+$DisabledOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
+$WhatIfMode = $true  # $true = preview, $false = delete
+
+# Report location
+$ReportFolder = "C:\Users\Administrator\Documents\ADCleanupReports"
+
+# Validate OU and import CSV
+Get-ADOrganizationalUnit -Identity $DisabledOU -ErrorAction Stop | Out-Null
+$Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+# Create report folder if needed
+New-Item -Path $ReportFolder -ItemType Directory -Force |
+    Out-Null
+
+# Process computers
+$Results = foreach ($Computer in $Computers) {
+
+    $Name = if ($null -ne $Computer.ComputerName) {
+        $Computer.ComputerName.Trim()
+    } else {
+        ""
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        [PSCustomObject]@{
+            ComputerName = "(blank)"
+            Status       = "SKIPPED"
+            Details      = "Empty computer name"
+        }
+        continue
+    }
+
+    try {
+        # Find computer account
+        $ADComputer = Get-ADComputer -Identity $Name `
+            -Properties DistinguishedName -ErrorAction Stop
+
+        # Verify computer is in Disabled OU or a child OU
+        if (-not $ADComputer.DistinguishedName.EndsWith(
+            ",$DisabledOU",
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            [PSCustomObject]@{
+                ComputerName = $Name
+                Status       = "BLOCKED"
+                Details      = "Computer is not inside the required Disabled OU"
+            }
+            continue
+        }
+
+        # Preview or delete
+        Remove-ADComputer -Identity $ADComputer `
+            -WhatIf:$WhatIfMode -Confirm:$false -ErrorAction Stop
+
+        [PSCustomObject]@{
+            ComputerName = $Name
+            Status       = if ($WhatIfMode) { "PREVIEW" } else { "DELETED" }
+            Details      = if ($WhatIfMode) {
+                "Verified in Disabled OU; would delete"
+            } else {
+                "Verified in Disabled OU; deletion requested"
+            }
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            ComputerName = $Name
+            Status       = "FAILED"
+            Details      = $_.Exception.Message
+        }
+    }
+}
+
+# Generate timestamped report
+$Timestamp = Get-Date -Format "yyyyMMdd"
+$ReportPath = "$ReportFolder\AD_Deletion_Report_$Timestamp.csv"
+
+# Export all results
+$Results | Export-Csv -Path $ReportPath -NoTypeInformation
+
+# Display summary
+Write-Host "`n========================================" -ForegroundColor DarkGray
+Write-Host " ACTIVE DIRECTORY DELETION SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor DarkGray
+
+$Results | Group-Object Status | Sort-Object Name |
+    ForEach-Object {
+        Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
+    }
+
+Write-Host "`nTotal processed: $($Results.Count)"
+
+# Display exceptions only
+$Exceptions = @($Results | Where-Object {
+    $_.Status -in @("FAILED", "BLOCKED", "SKIPPED")
+})
+
+if ($Exceptions.Count -gt 0) {
+    Write-Host "`n========== EXCEPTIONS ==========" -ForegroundColor Yellow
+
+    $Exceptions |
+        Format-Table ComputerName, Status, Details -AutoSize -Wrap
+}
+else {
+    Write-Host "`nNo exceptions encountered." -ForegroundColor Green
+}
+
+# Report location
+Write-Host "`nFull report saved to:" -ForegroundColor Cyan
+Write-Host $ReportPath -ForegroundColor Green
+
+Write-Host "`n========================================" -ForegroundColor DarkGray
