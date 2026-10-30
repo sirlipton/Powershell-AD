@@ -1,18 +1,29 @@
-
 Import-Module ActiveDirectory
 
 # Configuration
 $CsvPath = "C:\Users\Administrator\Documents\ComputersList.txt"
-$TargetOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
-$WhatIfMode = $true  # $true = preview, $false = execute
+$DisabledOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
+$WhatIfMode = $true  # $true = preview, $false = delete
+
+# Report location
+$ReportFolder = "C:\Users\Administrator\Documents\ADCleanupReports"
 
 # Validate OU and import CSV
-Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop | Out-Null
+Get-ADOrganizationalUnit -Identity $DisabledOU -ErrorAction Stop | Out-Null
 $Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+# Create report folder if needed
+New-Item -Path $ReportFolder -ItemType Directory -Force |
+    Out-Null
 
 # Process computers
 $Results = foreach ($Computer in $Computers) {
-    $Name = $Computer.ComputerName.Trim()
+
+    $Name = if ($null -ne $Computer.ComputerName) {
+        $Computer.ComputerName.Trim()
+    } else {
+        ""
+    }
 
     if ([string]::IsNullOrWhiteSpace($Name)) {
         [PSCustomObject]@{
@@ -24,43 +35,35 @@ $Results = foreach ($Computer in $Computers) {
     }
 
     try {
+        # Find computer account
         $ADComputer = Get-ADComputer -Identity $Name `
-            -Properties Enabled, DistinguishedName -ErrorAction Stop
+            -Properties DistinguishedName -ErrorAction Stop
 
-        $Disabled = -not $ADComputer.Enabled
-        $InTargetOU = $ADComputer.DistinguishedName.EndsWith(
-            ",$TargetOU",
+        # Verify computer is in Disabled OU or a child OU
+        if (-not $ADComputer.DistinguishedName.EndsWith(
+            ",$DisabledOU",
             [StringComparison]::OrdinalIgnoreCase
-        )
-
-        if ($Disabled -and $InTargetOU) {
-            $Status = "ALREADY DONE"
-            $Details = "Disabled and already in target OU"
+        )) {
+            [PSCustomObject]@{
+                ComputerName = $Name
+                Status       = "BLOCKED"
+                Details      = "Computer is not inside the required Disabled OU"
+            }
+            continue
         }
-        else {
-            if (-not $Disabled) {
-                Disable-ADAccount -Identity $ADComputer `
-                    -WhatIf:$WhatIfMode -ErrorAction Stop
-            }
 
-            if (-not $InTargetOU) {
-                Move-ADObject -Identity $ADComputer `
-                    -TargetPath $TargetOU `
-                    -WhatIf:$WhatIfMode -ErrorAction Stop
-            }
-
-            $Status = if ($WhatIfMode) { "PREVIEW" } else { "SUCCESS" }
-            $Details = if ($WhatIfMode) {
-                "Would disable and/or move as needed"
-            } else {
-                "Disabled and/or moved as needed"
-            }
-        }
+        # Preview or delete
+        Remove-ADComputer -Identity $ADComputer `
+            -WhatIf:$WhatIfMode -Confirm:$false -ErrorAction Stop
 
         [PSCustomObject]@{
             ComputerName = $Name
-            Status       = $Status
-            Details      = $Details
+            Status       = if ($WhatIfMode) { "PREVIEW" } else { "DELETED" }
+            Details      = if ($WhatIfMode) {
+                "Verified in Disabled OU; would delete"
+            } else {
+                "Verified in Disabled OU; deletion requested"
+            }
         }
     }
     catch {
@@ -72,11 +75,42 @@ $Results = foreach ($Computer in $Computers) {
     }
 }
 
-# Display results and summary
-$Results | Format-Table ComputerName, Status, Details -AutoSize -Wrap
+# Generate timestamped report
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$ReportPath = "$ReportFolder\AD_Deletion_Report_$Timestamp.csv"
 
-Write-Host "`nSUMMARY" -ForegroundColor Cyan
+# Export all results
+$Results | Export-Csv -Path $ReportPath -NoTypeInformation
+
+# Display summary
+Write-Host "`n========================================" -ForegroundColor DarkGray
+Write-Host " ACTIVE DIRECTORY DELETION SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor DarkGray
+
 $Results | Group-Object Status | Sort-Object Name |
     ForEach-Object {
         Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
     }
+
+Write-Host "`nTotal processed: $($Results.Count)"
+
+# Display exceptions only
+$Exceptions = @($Results | Where-Object {
+    $_.Status -in @("FAILED", "BLOCKED", "SKIPPED")
+})
+
+if ($Exceptions.Count -gt 0) {
+    Write-Host "`n========== EXCEPTIONS ==========" -ForegroundColor Yellow
+
+    $Exceptions |
+        Format-Table ComputerName, Status, Details -AutoSize -Wrap
+}
+else {
+    Write-Host "`nNo exceptions encountered." -ForegroundColor Green
+}
+
+# Report location
+Write-Host "`nFull report saved to:" -ForegroundColor Cyan
+Write-Host $ReportPath -ForegroundColor Green
+
+Write-Host "`n========================================" -ForegroundColor DarkGray
