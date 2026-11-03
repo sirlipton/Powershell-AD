@@ -1,25 +1,31 @@
-Import-Module ActiveDirectory
+```powershell
+Import-Module ActiveDirectory -ErrorAction Stop
 
 # Configuration
 $CsvPath = "C:\Users\Administrator\Documents\PowerShell\CompBatch1.txt"
 $TargetOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
+$ADServer = "local.int"
 $WhatIfMode = $true  # $true = preview, $false = execute
 
 # Report location
 $ReportFolder = "C:\Users\Administrator\Documents\ADCleanupReports"
 
-# Use one writable domain controller
-$ADServer = (Get-ADDomainController -Discover -Writable -ErrorAction Stop).HostName
+Write-Host "Using AD server: $ADServer" -ForegroundColor Cyan
 
-# Validate OU and import CSV
-Get-ADOrganizationalUnit -Identity $TargetOU -Server $ADServer -ErrorAction Stop | Out-Null
+# Validate target OU and import CSV
+Get-ADOrganizationalUnit -Identity $TargetOU `
+    -Server $ADServer -ErrorAction Stop | Out-Null
+
 $Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
 
 # Create report folder
-New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
+New-Item -Path $ReportFolder -ItemType Directory -Force |
+    Out-Null
 
 # Process computers
 $Results = foreach ($Computer in $Computers) {
+
+    $CurrentAction = "Read input"
 
     $Name = if ($null -ne $Computer.ComputerName) {
         $Computer.ComputerName.Trim()
@@ -38,6 +44,8 @@ $Results = foreach ($Computer in $Computers) {
 
     try {
         # Find computer account
+        $CurrentAction = "Find computer account"
+
         $ADComputer = Get-ADComputer -Identity $Name `
             -Properties Enabled, DistinguishedName `
             -Server $ADServer -ErrorAction Stop
@@ -91,7 +99,8 @@ $Results = foreach ($Computer in $Computers) {
                 # Verify final AD state
                 $CurrentAction = "Verify changes"
 
-                $UpdatedComputer = Get-ADComputer -Identity $ADComputer.ObjectGUID `
+                $UpdatedComputer = Get-ADComputer `
+                    -Identity $ADComputer.ObjectGUID `
                     -Properties Enabled, DistinguishedName `
                     -Server $ADServer -ErrorAction Stop
 
@@ -123,16 +132,16 @@ $Results = foreach ($Computer in $Computers) {
         [PSCustomObject]@{
             ComputerName = $Name
             Status       = "FAILED"
-            Details      = "$CurrentAction failed: $($_.Exception.Message)"
+            Details      = "${CurrentAction} failed: $($_.Exception.Message)"
         }
     }
 }
 
 # Generate timestamped report
 $Timestamp = Get-Date -Format "yyyyMMdd"
-$ReportPath = "$ReportFolder\AD_MoveDisable_Report_$Timestamp.csv"
+$ReportPath = Join-Path $ReportFolder "AD_MoveDisable_Report_$Timestamp.csv"
 
-# Export all results
+# Export results
 $Results | Export-Csv -Path $ReportPath -NoTypeInformation
 
 # Display summary
@@ -145,7 +154,7 @@ $Results | Group-Object Status | Sort-Object Name |
         Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
     }
 
-Write-Host "`nTotal processed: $($Results.Count)"
+Write-Host "`nTotal processed: $(@($Results).Count)"
 
 # Display exceptions
 $Exceptions = @($Results | Where-Object {
@@ -167,3 +176,4 @@ Write-Host "`nFull report saved to:" -ForegroundColor Cyan
 Write-Host $ReportPath -ForegroundColor Green
 
 Write-Host "`n========================================" -ForegroundColor DarkGray
+```
