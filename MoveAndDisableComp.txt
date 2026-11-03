@@ -176,4 +176,3 @@ Write-Host "`nFull report saved to:" -ForegroundColor Cyan
 Write-Host $ReportPath -ForegroundColor Green
 
 Write-Host "`n========================================" -ForegroundColor DarkGray
-```
