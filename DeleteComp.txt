@@ -77,7 +77,7 @@ $Results = foreach ($Computer in $Computers) {
 
 # Generate timestamped report
 $Timestamp = Get-Date -Format "yyyyMMdd"
-$ReportPath = "$ReportFolder\AD_Deletion_Report_$Timestamp.csv"
+$ReportPath = "$ReportFolder\AD_Comp_Deletion_Report_$Timestamp.csv"
 
 # Export all results
 $Results | Export-Csv -Path $ReportPath -NoTypeInformation
