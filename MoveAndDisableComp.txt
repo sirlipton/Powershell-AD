@@ -1,177 +1,305 @@
 Import-Module ActiveDirectory -ErrorAction Stop
 
-# Configuration
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 $CsvPath = "C:\Users\Administrator\Documents\PowerShell\CompBatch1.txt"
+
 $TargetOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
+
 $ADServer = "local.int"
+
 $WhatIfMode = $true  # $true = preview, $false = execute
 
-# Report location
 $ReportFolder = "C:\Users\Administrator\Documents\ADCleanupReports"
 
-Write-Host "Using AD server: $ADServer" -ForegroundColor Cyan
+# ============================================================
+# INITIAL SETUP
+# ============================================================
 
-# Validate target OU and import CSV
-Get-ADOrganizationalUnit -Identity $TargetOU `
-    -Server $ADServer -ErrorAction Stop | Out-Null
+$Results = [System.Collections.Generic.List[object]]::new()
 
-$Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
+# Track computer names to identify duplicates.
+# Duplicates will still be processed.
+$SeenComputers = @{}
 
-# Create report folder
-New-Item -Path $ReportFolder -ItemType Directory -Force |
-    Out-Null
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-# Process computers
-$Results = foreach ($Computer in $Computers) {
+$ReportPath = Join-Path $ReportFolder "AD_MoveDisable_Report_$Timestamp.csv"
 
-    $CurrentAction = "Read input"
+# Create report folder if it does not exist.
+if (-not (Test-Path $ReportFolder)) {
+    New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
+}
 
-    $Name = if ($null -ne $Computer.ComputerName) {
-        $Computer.ComputerName.Trim()
-    } else {
-        ""
+Write-Host ""
+Write-Host "==================================================" -ForegroundColor Cyan
+Write-Host " ACTIVE DIRECTORY COMPUTER DISABLE / MOVE REPORT" -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor Cyan
+
+Write-Host "AD Server: $ADServer"
+Write-Host "Destination: $TargetOU"
+
+if ($WhatIfMode) {
+    Write-Host "Mode: PREVIEW ONLY" -ForegroundColor Yellow
+}
+else {
+    Write-Host "Mode: LIVE EXECUTION" -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ============================================================
+# VALIDATE CONFIGURATION AND INPUT
+# ============================================================
+
+try {
+    Get-ADOrganizationalUnit -Identity $TargetOU -Server $ADServer -ErrorAction Stop | Out-Null
+
+    $ComputerList = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+    if (-not $ComputerList) {
+        throw "The CSV file is empty."
     }
 
+    if (-not ($ComputerList[0].PSObject.Properties.Name -contains "ComputerName")) {
+        throw "CSV file must contain a column named ComputerName."
+    }
+}
+catch {
+    Write-Host "SETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+# ============================================================
+# PROCESS COMPUTERS
+# ============================================================
+
+foreach ($Computer in $ComputerList) {
+
+    $Name = ([string]$Computer.ComputerName).Trim()
+
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        [PSCustomObject]@{
-            ComputerName = "(blank)"
+
+        $Results.Add([PSCustomObject]@{
+            ComputerName = "(Blank)"
             Status       = "SKIPPED"
-            Details      = "Empty computer name"
-        }
+            Duplicate    = "NO"
+            Details      = "Computer name is blank"
+        })
+
         continue
     }
 
-    try {
-        # Find computer account
-        $CurrentAction = "Find computer account"
+    # Check whether this computer name appeared previously.
+    # Do not skip it if it is a duplicate.
+    $DuplicateKey = $Name.ToUpperInvariant()
+    $IsDuplicate = $SeenComputers.ContainsKey($DuplicateKey)
 
+    if ($IsDuplicate) {
+        Write-Host "DUPLICATE ENTRY: $Name - Processing anyway" -ForegroundColor Yellow
+    }
+    else {
+        $SeenComputers[$DuplicateKey] = $true
+    }
+
+    $DuplicateStatus = if ($IsDuplicate) { "YES" } else { "NO" }
+
+    $CurrentAction = "Read computer from Active Directory"
+
+    try {
+
+        Write-Host "Processing: $Name" -ForegroundColor Cyan
+
+        # Retrieve computer object.
         $ADComputer = Get-ADComputer -Identity $Name `
             -Properties Enabled, DistinguishedName `
-            -Server $ADServer -ErrorAction Stop
+            -Server $ADServer `
+            -ErrorAction Stop
 
-        # Check current status
-        $Disabled = -not $ADComputer.Enabled
+        $IsDisabled = -not $ADComputer.Enabled
 
-        $InTargetOU = $ADComputer.DistinguishedName.EndsWith(
+        $IsInTargetOU = $ADComputer.DistinguishedName.EndsWith(
             ",$TargetOU",
-            [StringComparison]::OrdinalIgnoreCase
+            [System.StringComparison]::OrdinalIgnoreCase
         )
 
-        # Skip if already complete
-        if ($Disabled -and $InTargetOU) {
-            $Status = "ALREADY DONE"
-            $Details = "Disabled and already in target OU"
+        # Determine required actions.
+        $Actions = @()
+
+        if ($IsDisabled -and $IsInTargetOU) {
+
+            $Results.Add([PSCustomObject]@{
+                ComputerName = $Name
+                Status       = "ALREADY DONE"
+                Duplicate    = $DuplicateStatus
+                Details      = "Computer is already disabled and in the destination OU"
+            })
+
+            Write-Host "Already disabled and in destination OU." -ForegroundColor Green
+            continue
         }
+
+        if (-not $IsDisabled) {
+            $Actions += "Disable"
+        }
+
+        if (-not $IsInTargetOU) {
+            $Actions += "Move"
+        }
+
+        # Disable computer if necessary.
+        if (-not $IsDisabled) {
+
+            $CurrentAction = "Disable computer"
+
+            Disable-ADAccount -Identity $ADComputer.ObjectGUID `
+                -Server $ADServer `
+                -WhatIf:$WhatIfMode `
+                -ErrorAction Stop
+        }
+
+        # Move computer if necessary.
+        if (-not $IsInTargetOU) {
+
+            $CurrentAction = "Move computer"
+
+            Move-ADObject -Identity $ADComputer.ObjectGUID `
+                -TargetPath $TargetOU `
+                -Server $ADServer `
+                -WhatIf:$WhatIfMode `
+                -ErrorAction Stop
+        }
+
+        # Preview result.
+        if ($WhatIfMode) {
+
+            $Results.Add([PSCustomObject]@{
+                ComputerName = $Name
+                Status       = "PREVIEW"
+                Duplicate    = $DuplicateStatus
+                Details      = "Would perform: $($Actions -join ', ')"
+            })
+
+            Write-Host "Preview completed: $($Actions -join ', ')" -ForegroundColor Yellow
+        }
+
+        # Verify actual changes.
         else {
-            $Actions = @()
 
-            # Disable account if necessary
-            if (-not $Disabled) {
-                $CurrentAction = "Disable account"
+            $CurrentAction = "Verify computer status"
 
-                Disable-ADAccount -Identity $ADComputer.ObjectGUID `
-                    -Server $ADServer `
-                    -WhatIf:$WhatIfMode `
-                    -ErrorAction Stop
+            $VerifiedComputer = Get-ADComputer -Identity $ADComputer.ObjectGUID `
+                -Properties Enabled, DistinguishedName `
+                -Server $ADServer `
+                -ErrorAction Stop
 
-                $Actions += "Disable"
-            }
+            $VerifiedDisabled = -not $VerifiedComputer.Enabled
 
-            # Move object if necessary
-            if (-not $InTargetOU) {
-                $CurrentAction = "Move computer object"
+            $VerifiedInTargetOU = $VerifiedComputer.DistinguishedName.EndsWith(
+                ",$TargetOU",
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
 
-                Move-ADObject -Identity $ADComputer.ObjectGUID `
-                    -TargetPath $TargetOU `
-                    -Server $ADServer `
-                    -WhatIf:$WhatIfMode `
-                    -ErrorAction Stop
+            if ($VerifiedDisabled -and $VerifiedInTargetOU) {
 
-                $Actions += "Move"
-            }
+                $Results.Add([PSCustomObject]@{
+                    ComputerName = $Name
+                    Status       = "SUCCESS"
+                    Duplicate    = $DuplicateStatus
+                    Details      = "Successfully disabled and moved to destination OU"
+                })
 
-            if ($WhatIfMode) {
-                $Status = "PREVIEW"
-                $Details = "Would perform: $($Actions -join ' and ')"
+                Write-Host "SUCCESS: $Name" -ForegroundColor Green
             }
             else {
-                # Verify final AD state
-                $CurrentAction = "Verify changes"
 
-                $UpdatedComputer = Get-ADComputer `
-                    -Identity $ADComputer.ObjectGUID `
-                    -Properties Enabled, DistinguishedName `
-                    -Server $ADServer -ErrorAction Stop
+                $VerificationDetails = "Disabled: $VerifiedDisabled; In Target OU: $VerifiedInTargetOU"
 
-                $VerifiedDisabled = -not $UpdatedComputer.Enabled
+                $Results.Add([PSCustomObject]@{
+                    ComputerName = $Name
+                    Status       = "VERIFY FAILED"
+                    Duplicate    = $DuplicateStatus
+                    Details      = $VerificationDetails
+                })
 
-                $VerifiedInOU = $UpdatedComputer.DistinguishedName.EndsWith(
-                    ",$TargetOU",
-                    [StringComparison]::OrdinalIgnoreCase
-                )
-
-                if ($VerifiedDisabled -and $VerifiedInOU) {
-                    $Status = "SUCCESS"
-                    $Details = "Computer disabled and moved successfully; changes verified"
-                }
-                else {
-                    $Status = "VERIFY FAILED"
-                    $Details = "Final state does not match requirements. Disabled: $VerifiedDisabled; In target OU: $VerifiedInOU"
-                }
+                Write-Host "VERIFY FAILED: $Name" -ForegroundColor Red
             }
-        }
-
-        [PSCustomObject]@{
-            ComputerName = $Name
-            Status       = $Status
-            Details      = $Details
         }
     }
     catch {
-        [PSCustomObject]@{
+
+        $Results.Add([PSCustomObject]@{
             ComputerName = $Name
             Status       = "FAILED"
-            Details      = "${CurrentAction} failed: $($_.Exception.Message)"
-        }
+            Duplicate    = $DuplicateStatus
+            Details      = "$CurrentAction failed: $($_.Exception.Message)"
+        })
+
+        Write-Host "FAILED: $Name - $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# Generate timestamped report
-$Timestamp = Get-Date -Format "yyyyMMdd"
-$ReportPath = Join-Path $ReportFolder "AD_MoveDisable_Report_$Timestamp.csv"
+# ============================================================
+# EXPORT FULL REPORT
+# ============================================================
 
-# Export results
-$Results | Export-Csv -Path $ReportPath -NoTypeInformation
+$Results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
 
-# Display summary
-Write-Host "`n========================================" -ForegroundColor DarkGray
-Write-Host " ACTIVE DIRECTORY DISABLE / MOVE SUMMARY" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor DarkGray
+# ============================================================
+# SUMMARY
+# ============================================================
 
-$Results | Group-Object Status | Sort-Object Name |
+Write-Host ""
+Write-Host "==================================================" -ForegroundColor Cyan
+Write-Host " SUMMARY" -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor Cyan
+
+$Results |
+    Group-Object Status |
+    Sort-Object Name |
     ForEach-Object {
-        Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
+        Write-Host ("{0,-18} {1}" -f $_.Name, $_.Count)
     }
 
-Write-Host "`nTotal processed: $(@($Results).Count)"
+$DuplicateCount = @($Results | Where-Object {
+    $_.Duplicate -eq "YES"
+}).Count
 
-# Display exceptions
+Write-Host ""
+Write-Host "Duplicate entries: $DuplicateCount" -ForegroundColor Yellow
+
+# ============================================================
+# EXCEPTIONS REPORT
+# ============================================================
+
 $Exceptions = @($Results | Where-Object {
-    $_.Status -in @("FAILED", "VERIFY FAILED", "SKIPPED")
+
+    $_.Status -in @("FAILED", "VERIFY FAILED", "SKIPPED") -or
+    $_.Duplicate -eq "YES"
+
 })
 
+Write-Host ""
+Write-Host "==================================================" -ForegroundColor Cyan
+Write-Host " EXCEPTIONS" -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor Cyan
+
 if ($Exceptions.Count -gt 0) {
-    Write-Host "`n========== EXCEPTIONS ==========" -ForegroundColor Yellow
 
     $Exceptions |
-        Format-Table ComputerName, Status, Details -AutoSize -Wrap
+        Format-Table ComputerName, Status, Duplicate, Details -AutoSize -Wrap
+
 }
 else {
-    Write-Host "`nNo exceptions encountered." -ForegroundColor Green
+
+    Write-Host "No exceptions found." -ForegroundColor Green
 }
 
-# Report location
-Write-Host "`nFull report saved to:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Full report saved to:"
 Write-Host $ReportPath -ForegroundColor Green
 
-Write-Host "`n========================================" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "Processing complete." -ForegroundColor Cyan
