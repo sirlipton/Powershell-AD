@@ -1,116 +1,129 @@
-Import-Module ActiveDirectory
+Import-Module ActiveDirectory -ErrorAction Stop
 
 # Configuration
-$CsvPath = "C:\Users\Administrator\Documents\ComputersList.txt"
+$CsvPath = "C:\Users\Administrator\Documents\PowerShell\CompBatch1.txt" #Change filepath as needed
 $DisabledOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
-$WhatIfMode = $true  # $true = preview, $false = delete
-
-# Report location
+$ADServer = "local.int"
+$WhatIfMode = $true  #true = test, false = delete
 $ReportFolder = "C:\Users\Administrator\Documents\ADCleanupReports"
 
-# Validate OU and import CSV
-Get-ADOrganizationalUnit -Identity $DisabledOU -ErrorAction Stop | Out-Null
-$Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
+# Setup
+$Results = [System.Collections.Generic.List[object]]::new()
+$SeenComputers = @{}
+$Timestamp = Get-Date -Format "yyyyMMdd"
+$ReportPath = Join-Path $ReportFolder "AD_Comp_Deletion_Report_$Timestamp.csv"
 
-# Create report folder if needed
-New-Item -Path $ReportFolder -ItemType Directory -Force |
-    Out-Null
+function Add-Result {
+    param($Name, $Status, $Duplicate, $Details)
+
+    $Results.Add([PSCustomObject]@{
+        ComputerName = $Name
+        Status       = $Status
+        Duplicate    = $Duplicate
+        Details      = $Details
+    })
+}
+
+# Validate OU and CSV
+try {
+    Get-ADOrganizationalUnit -Identity $DisabledOU -Server $ADServer -ErrorAction Stop | Out-Null
+    $Computers = Import-Csv -Path $CsvPath -ErrorAction Stop
+
+    if (-not $Computers) { throw "CSV file is empty." }
+    if ($Computers[0].PSObject.Properties.Name -notcontains "ComputerName") {
+        throw "CSV must contain a ComputerName column."
+    }
+}
+catch {
+    Write-Host "SETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
+
+Write-Host "`nAD Computer Deletion - $ADServer" -ForegroundColor Cyan
+Write-Host "Required OU: $DisabledOU"
+
+if ($WhatIfMode) {
+    Write-Host "Mode: PREVIEW ONLY" -ForegroundColor Yellow
+}
+else {
+    Write-Host "Mode: LIVE DELETION" -ForegroundColor Red
+}
 
 # Process computers
-$Results = foreach ($Computer in $Computers) {
+foreach ($Computer in $Computers) {
 
-    $Name = if ($null -ne $Computer.ComputerName) {
-        $Computer.ComputerName.Trim()
-    } else {
-        ""
-    }
+    $Name = ([string]$Computer.ComputerName).Trim()
 
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        [PSCustomObject]@{
-            ComputerName = "(blank)"
-            Status       = "SKIPPED"
-            Details      = "Empty computer name"
-        }
+        Add-Result "(Blank)" "SKIPPED" "NO" "Empty computer name"
         continue
     }
 
-    try {
-        # Find computer account
-        $ADComputer = Get-ADComputer -Identity $Name `
-            -Properties DistinguishedName -ErrorAction Stop
+    # Detect duplicates but still process them
+    $Key = $Name.ToUpperInvariant()
+    $IsDuplicate = $SeenComputers.ContainsKey($Key)
+    $SeenComputers[$Key] = $true
+    $Duplicate = if ($IsDuplicate) { "YES" } else { "NO" }
 
-        # Verify computer is in Disabled OU or a child OU
+    try {
+        Write-Host "`nProcessing: $Name" -ForegroundColor Cyan
+
+        $ADComputer = Get-ADComputer -Identity $Name `
+            -Properties DistinguishedName -Server $ADServer -ErrorAction Stop
+
+        # Only delete computers in the Disabled OU or its child OUs
         if (-not $ADComputer.DistinguishedName.EndsWith(
             ",$DisabledOU",
-            [StringComparison]::OrdinalIgnoreCase
+            [System.StringComparison]::OrdinalIgnoreCase
         )) {
-            [PSCustomObject]@{
-                ComputerName = $Name
-                Status       = "BLOCKED"
-                Details      = "Computer is not inside the required Disabled OU"
-            }
+            Add-Result $Name "BLOCKED" $Duplicate "Outside required Disabled OU"
             continue
         }
 
-        # Preview or delete
-        Remove-ADComputer -Identity $ADComputer `
+        Remove-ADComputer -Identity $ADComputer -Server $ADServer `
             -WhatIf:$WhatIfMode -Confirm:$false -ErrorAction Stop
 
-        [PSCustomObject]@{
-            ComputerName = $Name
-            Status       = if ($WhatIfMode) { "PREVIEW" } else { "DELETED" }
-            Details      = if ($WhatIfMode) {
-                "Verified in Disabled OU; would delete"
-            } else {
-                "Verified in Disabled OU; deletion requested"
-            }
+        if ($WhatIfMode) {
+            Add-Result $Name "PREVIEW" $Duplicate "Would delete"
+        }
+        else {
+            Add-Result $Name "DELETED" $Duplicate "Deletion command completed"
         }
     }
     catch {
-        [PSCustomObject]@{
-            ComputerName = $Name
-            Status       = "FAILED"
-            Details      = $_.Exception.Message
-        }
+        Add-Result $Name "FAILED" $Duplicate $_.Exception.Message
     }
 }
 
-# Generate timestamped report
-$Timestamp = Get-Date -Format "yyyyMMdd"
-$ReportPath = "$ReportFolder\AD_Comp_Deletion_Report_$Timestamp.csv"
+# Export report
+$Results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
 
-# Export all results
-$Results | Export-Csv -Path $ReportPath -NoTypeInformation
-
-# Display summary
-Write-Host "`n========================================" -ForegroundColor DarkGray
-Write-Host " ACTIVE DIRECTORY DELETION SUMMARY" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor DarkGray
+# Summary
+Write-Host "`n========== SUMMARY ==========" -ForegroundColor Cyan
 
 $Results | Group-Object Status | Sort-Object Name |
     ForEach-Object {
         Write-Host ("{0,-15} {1}" -f $_.Name, $_.Count)
     }
 
+$DuplicateCount = @($Results | Where-Object Duplicate -eq "YES").Count
 Write-Host "`nTotal processed: $($Results.Count)"
+Write-Host "Duplicate entries: $DuplicateCount" -ForegroundColor Yellow
 
-# Display exceptions only
+# Exceptions
 $Exceptions = @($Results | Where-Object {
-    $_.Status -in @("FAILED", "BLOCKED", "SKIPPED")
+    $_.Status -in @("FAILED", "BLOCKED", "SKIPPED") -or $_.Duplicate -eq "YES"
 })
 
-if ($Exceptions.Count -gt 0) {
-    Write-Host "`n========== EXCEPTIONS ==========" -ForegroundColor Yellow
+Write-Host "`n========== EXCEPTIONS ==========" -ForegroundColor Yellow
 
-    $Exceptions |
-        Format-Table ComputerName, Status, Details -AutoSize -Wrap
+if ($Exceptions.Count) {
+    $Exceptions | Format-Table ComputerName, Status, Duplicate, Details -AutoSize -Wrap
 }
 else {
-    Write-Host "`nNo exceptions encountered." -ForegroundColor Green
+    Write-Host "No exceptions found." -ForegroundColor Green
 }
 
-# Report location
-Write-Host "`nFull report saved to:" -ForegroundColor Cyan
-Write-Host $ReportPath -ForegroundColor Green
-
-Write-Host "`n========================================" -ForegroundColor DarkGray
+Write-Host "`nReport saved to: $ReportPath" -ForegroundColor Green
