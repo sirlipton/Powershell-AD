@@ -1,0 +1,51 @@
+# Import the Active Directory module
+Import-Module ActiveDirectory
+
+# Specify the AD domain
+$Domain = "local.int"
+
+# Set output file path with today's date
+$Today = Get-Date -Format "yyyyMMdd"
+$OutputFile = "C:\Temp\All_AD_Users_Local_$Today.csv"
+
+# Ensure the output directory exists
+$OutputDirectory = Split-Path $OutputFile
+if (-not (Test-Path $OutputDirectory)) {
+    New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+}
+
+# Retrieve all AD users from local.int
+Get-ADUser -Server $Domain -Filter * -Properties `
+    UserPrincipalName,
+    Enabled,
+    Mail,
+    EmployeeID,
+    LastLogonTimestamp,
+    AccountExpirationDate,
+    WhenCreated,
+    PasswordExpired,
+    Description |
+Select-Object `
+    @{Name='Sid'; Expression={$_.SID.Value}},
+    @{Name='Name'; Expression={$_.Name}},
+    @{Name='SamAccountName'; Expression={$_.SamAccountName}},
+    @{Name='UserPrincipalName'; Expression={$_.UserPrincipalName}},
+    @{Name='Enabled'; Expression={$_.Enabled}},
+    @{Name='Mail'; Expression={$_.Mail}},
+    @{Name='EmployeeID'; Expression={$_.EmployeeID}},
+    @{Name='DistinguishedName'; Expression={$_.DistinguishedName}},
+    @{Name='LastLogonTimestamp'; Expression={
+        if ($_.LastLogonTimestamp) {
+            [DateTime]::FromFileTime($_.LastLogonTimestamp)
+        } else {
+            $null
+        }
+    }},
+    @{Name='AccountExpirationDate'; Expression={$_.AccountExpirationDate}},
+    @{Name='WhenCreated'; Expression={$_.WhenCreated}},
+    @{Name='PasswordExpired'; Expression={$_.PasswordExpired}},
+    @{Name='Description'; Expression={$_.Description}} |
+Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "Export complete: $OutputFile"
+
