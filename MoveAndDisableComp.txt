@@ -1,7 +1,7 @@
 Import-Module ActiveDirectory
 
 # Configuration
-$CsvPath = "C:\Users\Administrator\Documents\ComputersList.txt"
+$CsvPath = "C:\Users\Administrator\Documents\PowerShell\CompBatch1.txt"
 $TargetOU = "OU=Computers,OU=Disabled Objects,DC=local,DC=int"
 $WhatIfMode = $true  # $true = preview, $false = execute
 
